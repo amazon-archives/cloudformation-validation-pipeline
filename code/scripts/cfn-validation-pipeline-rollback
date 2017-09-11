@@ -1,0 +1,162 @@
+#!/usr/bin/env python
+import argparse
+import boto3
+from datetime import datetime
+import json
+import logging
+from pprint import pprint
+from operator import itemgetter
+
+
+def extract_commits(s3_objects, prefix):
+    commits = {}
+    for o in s3_objects:
+        commit_id = o['Key'].replace(prefix, '').split('/')[1]
+        if commit_id != 'latest':
+            commits[commit_id] = o['LastModified']
+    return commits
+
+
+def get_latest(bucket, key, region):
+    if region:
+        s3_client = boto3.client('s3', region_name=region)
+        s3_resource = boto3.resource('s3', region_name=region)
+    else:
+        s3_client = boto3.client('s3')
+        s3_resource = boto3.resource('s3')
+    results = s3_client.list_objects_v2(Bucket=bucket, Prefix=key+'/latest/', MaxKeys=1)
+    key = results['Contents'][0]['Key']
+    s3_object = s3_resource.Object(bucket, key)
+    if 'git_revision_id' in s3_object.metadata:
+        return s3_object.metadata['git_revision_id']
+    else:
+        return None
+
+
+def list_commits(pipeline_name, region):
+    bucket, key = get_s3_path(pipeline_name, region)
+    latest = get_latest(bucket, key, region)
+    if region:
+        s3_client = boto3.client('s3', region_name=region)
+    else:
+        s3_client = boto3.client('s3')
+    results = s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
+    commits = extract_commits(results['Contents'], key)
+    while results['IsTruncated']:
+        logging.debug("result is truncated, fetching more objects...")
+        results = s3_client.list_objects_v2(Bucket=bucket, Prefix=key, ContinuationToken=results['NextContinuationToken'])
+        commits.update(extract_commits(results['Contents'], key))
+    return commits, latest, bucket, key
+
+
+def get_s3_path(pipeline_name, region):
+    if region:
+        cp_client = boto3.client('codepipeline', region_name=region)
+    else:
+        cp_client = boto3.client('codepipeline')
+    response = cp_client.get_pipeline(name=pipeline_name)
+    bucket, key = [None, None]
+    for stage in response['pipeline']['stages']:
+        logging.debug("checking stage %s" % stage['name'])
+        for action in stage['actions']:
+            logging.debug("checking action %s in stage %s" % (action['name'], stage['name']))
+            if 'UserParameters' in action['configuration'].keys():
+                try:
+                    user_params = json.loads(action['configuration']['UserParameters'])
+                    if 'DeployKey' in user_params.keys() and 'DeployBucket' in user_params.keys():
+                        logging.debug("matched action %s in stage %s" % (action['name'], stage['name']))
+                        bucket = user_params['DeployBucket']
+                        key = user_params['DeployKey']
+                except Exception:
+                    logging.debug("failed to get UserParameters", exc_info=1)
+                    pass
+    if bucket and key:
+        return bucket, key
+    else:
+        raise ValueError("could not find a deploy to S3 action (requires DeployBucket and DeployKey in UserParameters json)")
+
+
+def delete_latest(bucket, key, region):
+    if region:
+        s3_client = boto3.client('s3', region_name=region)
+    else:
+        s3_client = boto3.client('s3')
+    prefix = key + '/latest/'
+    logging.debug("Deleting %s prefix" % prefix)
+    response = s3_client.list_objects(Bucket=bucket, Prefix=prefix)
+    if 'Contents' in response.keys():
+        s3_client.delete_objects(
+            Bucket=bucket,
+            Delete={'Objects': [{"Key": dkey['Key']} for dkey in response['Contents']]}
+        )
+    while 'NextMarker' in response:
+        response = s3_client.list_objects(Bucket=bucket, Prefix=prefix, Marker=response['NextMarker'])
+        if 'Contents' in response.keys():
+            s3_client.delete_objects(
+                Bucket=bucket,
+                Delete={'Objects': [{"Key": dkey['Key']} for dkey in response['Contents']]}
+            )
+    return
+
+
+def new_latest(commit, bucket, key, region):
+    delete_latest(bucket, key, region)
+    if region:
+        s3_client = boto3.client('s3', region_name=region)
+    else:
+        s3_client = boto3.client('s3')
+    logging.debug("copying %s prefix to latest" % key+'/'+commit+'/')
+    results = s3_client.list_objects_v2(Bucket=bucket, Prefix=key+'/'+commit+'/')
+    objects_to_latest(s3_client, results['Contents'], commit, bucket, key)
+    while results['IsTruncated']:
+        logging.debug("result is truncated, fetching more objects...")
+        results = s3_client.list_objects_v2(Bucket=bucket, Prefix=key+'/'+commit+'/', ContinuationToken=results['NextContinuationToken'])
+        objects_to_latest(s3_client, results['Contents'], commit, bucket, key)
+
+
+def objects_to_latest(s3_client, objects, commit, bucket, key):
+    for o in objects:
+        src_key = o['Key']
+        dst_key = src_key.replace(commit, 'latest')
+        s3_client.copy_object(Bucket=bucket, Key=dst_key, CopySource={'Bucket': bucket, 'Key': src_key})
+    return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("-p", "--pipeline-name", dest="pipeline", help="Name of the pipeline", required=True)
+    parser.add_argument("-c", "--commit", dest="commit", help="commit to revert to")
+    parser.add_argument("-r", "--region", dest="region", help="aws region that contains the pipeline")
+    parser.add_argument("-l", "--list", dest="list", help="list available commits", action="store_true")
+    parser.add_argument("-d", "--debug", dest="debug", help="enable debugging output", action="store_true")
+
+    args = parser.parse_args()
+    # --commit is required if --list is not specified
+    if not args.list and args.commit is None:
+            parser.error('argument -c/--commit is required')
+
+    parser.parse_args()
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.getLogger('boto3').setLevel(logging.ERROR)
+        logging.getLogger('botocore').setLevel(logging.ERROR)
+        logging.getLogger('nose').setLevel(logging.ERROR)
+        logging.getLogger('s3transfer').setLevel(logging.ERROR)
+
+    commits, latest, bucket, key = list_commits(args.pipeline, args.region)
+    if args.list:
+        commit_list = []
+        for c in commits.keys():
+            commit_list.append([c, commits[c]])
+        commit_list.sort(key=itemgetter(1), reverse=True)
+        for c in commit_list:
+            if c[0] == latest:
+                print("%s %s [LATEST]" % (c[0], c[1]))
+            else:
+                print("%s %s" % (c[0], c[1]))
+    else:
+        if latest == args.commit:
+            parser.error('commit %s is already set to latest' % args.commit)
+        else:
+            new_latest(args.commit, bucket, key, args.region)

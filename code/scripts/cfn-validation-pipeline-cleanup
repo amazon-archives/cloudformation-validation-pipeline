@@ -1,0 +1,223 @@
+#!/usr/bin/env python
+import argparse
+import boto3
+from datetime import datetime
+from datetime import timedelta
+import json
+import logging
+from time import sleep
+
+
+def get_regions(region, service):
+    if region == 'ALL':
+        # s = boto3.session.Session(region_name='us-east-1')
+        return boto3.get_available_regions(service)
+    else:
+        return [region]
+
+
+def get_all_pipelines(region):
+    regions = get_regions(region, 'codepipeline')
+    pipelines = {}
+    for region in regions:
+        cp_client = boto3.client('codepipeline', region_name=region)
+        response = cp_client.list_pipelines()
+        for pipeline in response['pipelines']:
+            matched = False
+            pl_detail = cp_client.get_pipeline(name=pipeline['name'])
+            for stage in pl_detail['pipeline']['stages']:
+                for action in stage['actions']:
+                    if 'UserParameters' in action['configuration']:
+                        try:
+                            params = json.loads(action['configuration']['UserParameters']).keys()
+                            if 'CleanupNonFailed' in params and 'StackCreationRoleArn' in params:
+                                matched = True
+                        except ValueError as e:
+                            if e.args[0] != 'No JSON object could be decoded':
+                                raise
+
+            if matched:
+                pipelines[pipeline['name']] = region
+    return pipelines
+
+
+def get_all_stacks():
+    regions = get_regions('ALL', 'cloudformation')
+    stacks = {}
+    for region in regions:
+        stacks[region] = []
+        cfn_client = boto3.client('cloudformation', region_name=region)
+        response = cfn_client.list_stacks(StackStatusFilter=[
+            'CREATE_FAILED', 'CREATE_COMPLETE', 'ROLLBACK_COMPLETE',
+            'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE', 'DELETE_FAILED'])
+        for stack in response['StackSummaries']:
+            describe_response = cfn_client.describe_stacks(StackName=stack['StackName'])
+            for tag in describe_response['Stacks'][0]['Tags']:
+                if tag['Key'] == 'cfn_cicd_pipeline':
+                    stacks[region].append({
+                        'name': stack['StackName'], 'pipeline': tag['Value'],
+                        'status': stack['StackStatus'], 'created': stack['CreationTime'].replace(tzinfo=None),
+                        'tags': describe_response['Stacks'][0]['Tags'], 'region': region})
+    return stacks
+
+
+def get_all_keypairs():
+    regions = get_regions('ALL', 'ec2')
+    key_pairs = {}
+    for region in regions:
+        key_pairs[region] = []
+        ec2_client = boto3.client('ec2', region_name=region)
+        response = ec2_client.describe_key_pairs()
+        for kp in response['KeyPairs']:
+            if kp['KeyName'].startswith('ci-'):
+                key_pairs[region].append(kp['KeyName'])
+    return key_pairs
+
+
+def iter_stacks(stacks, filter_func, filter_val):
+    filtered_stacks = {}
+    for region in stacks.keys():
+        filtered_stacks[region] = []
+        for stack in stacks[region]:
+            if filter_func(stack, filter_val):
+                filtered_stacks[region].append(stack)
+    return filtered_stacks
+
+
+def filter_pipeline_name(stack, pipeline_name):
+    for tag in stack['tags']:
+        if tag['Key'] == 'cfn_cicd_pipeline' and tag['Value'] == pipeline_name:
+            return True
+    return False
+
+
+def filter_failed(stack, failed):
+    if stack['status'] not in ['CREATE_FAILED', 'ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE']:
+            return True
+    return False
+
+
+def filter_age(stack, age):
+    min_age = datetime.utcnow() - timedelta(days=age)
+    if stack['created'] < min_age:
+            return True
+    return False
+
+
+def filter_latest(stack, pipelines):
+    pipeline_name = None
+    execution_id = None
+    for tag in stack['tags']:
+        if tag['Key'] == 'cfn_cicd_pipeline':
+            pipeline_name = tag['Value']
+        elif tag['Key'] == 'cfn_cicd_executionid':
+            execution_id = tag['Value']
+    if pipeline_name not in pipelines.keys():
+        return False
+    cp_client = boto3.client('codepipeline', region_name=pipelines[pipeline_name])
+    response = cp_client.get_pipeline_state(name=pipeline_name)
+    if response['stageStates'][0]['latestExecution']['pipelineExecutionId'] == execution_id:
+        return False
+    return True
+
+
+def delete_stacks(stacks):
+    for region in stacks.keys():
+        if len(stacks[region]) > 0:
+            cfn_client = boto3.client('cloudformation', region_name=region)
+            for stack in stacks[region]:
+                print('deleting stack %s in %s from pipeline %s' % (stack['name'], region, stack['pipeline']))
+                try:
+                    cfn_client.delete_stack(StackName=stack['name'])
+                except Exception as e:
+                    if e.args[0].endswith('is invalid or cannot be assumed'):
+                        try:
+                            arn = get_role_arn()
+                            cfn_client.delete_stack(StackName=stack['name'], RoleARN=arn)
+                        except Exception as e:
+                            print('Failed to delete stack %s' % (str(stack)))
+                            print(str(e))
+                    else:
+                        print('Failed to delete stack %s' % (str(stack)))
+                        print(str(e))
+
+
+def get_role_arn():
+    try:
+        return iam_client.get_role(RoleName='TemplateCI-StackCleanUp')['Role']['Arn']
+    except Exception:
+        return ""
+
+
+def delete_keypairs(region, keypairs):
+    ec2_client = boto3.client('ec2', region_name=region)
+    for kp in keypairs:
+        ec2_client.delete_key_pair(KeyName=kp)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("-p", "--pipeline-name", dest="pipeline", help="Name of the pipeline")
+    parser.add_argument("-r", "--region", dest="region", help="aws region that contains the pipeline(s) to cleanup", default='ALL')
+    parser.add_argument("-pr", "--profile", dest="profile", help="aws cli profile that you want to run as")
+    parser.add_argument("-a", "--age", dest="age", help="minimum stack age in days to delete", default=2, type=int)
+    parser.add_argument("-l", "--latest", dest="latest", action="store_true", help="skip stacks associated with most recent pipeline execution")
+    parser.add_argument("-f", "--failed", dest="failed", action="store_true", help="include stacks that have a failed status")
+    parser.add_argument("-d", "--debug", dest="debug", help="enable debugging output", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.getLogger('boto3').setLevel(logging.ERROR)
+        logging.getLogger('botocore').setLevel(logging.ERROR)
+        logging.getLogger('nose').setLevel(logging.ERROR)
+        logging.getLogger('s3transfer').setLevel(logging.ERROR)
+
+    if args.profile:
+        boto3 = boto3.Session(profile_name=args.profile, region_name='us-east-1')
+    else:
+        boto3 = boto3.Session(region_name='us-east-1')
+    iam_client = boto3.client('iam')
+    print('Getting stacks...')
+    stacks = get_all_stacks()
+
+    print("Cleanup orphaned stacks...")
+    orphaned = {}
+    pipelines = get_all_pipelines('ALL')
+    for region in stacks.keys():
+        for stack in stacks[region]:
+            if stack['pipeline'] not in pipelines.keys():
+                try:
+                    orphaned[region].append(stack)
+                except Exception:
+                    orphaned[region] = [stack]
+                logging.debug([stack['pipeline'], pipelines.keys()])
+                logging.debug("stack %s is orphaned" % stack['name'])
+    delete_stacks(orphaned)
+
+    print("Cleanup keypairs...")
+    key_pairs = get_all_keypairs()
+    for region in key_pairs.keys():
+        kp_to_delete = []
+        for kp in key_pairs[region]:
+            stack_list = [s['name'] for s in stacks[region]]
+            if kp not in stack_list:
+                kp_to_delete.append(kp)
+        if len(kp_to_delete) > 0:
+            delete_keypairs(region, kp_to_delete)
+
+    print('getting pipelines...')
+    pipelines = get_all_pipelines(args.region)
+    logging.debug(pipelines)
+    if args.pipeline:
+        stacks = iter_stacks(stacks, filter_pipeline_name, args.pipeline)
+    if not args.failed:
+        stacks = iter_stacks(stacks, filter_failed, args.failed)
+    if args.age > 0:
+        stacks = iter_stacks(stacks, filter_age, args.age)
+    if args.latest:
+        stacks = iter_stacks(stacks, filter_latest, pipelines)
+    logging.debug(stacks)
+    delete_stacks(stacks)

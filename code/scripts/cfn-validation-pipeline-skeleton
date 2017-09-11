@@ -1,0 +1,43 @@
+#!/usr/bin/env python
+import argparse
+from distutils.version import LooseVersion
+import os
+import shutil
+import sys
+import zipfile
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('path', type=str, nargs='?', default='./',
+                        help='path to create a project skeleton in, defaults to current directory')
+
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.path[0]):
+        os.mkdir(args.path[0])
+    skeleton_path = '0'
+    for p in sys.path:
+        if 'aws_cloudformation_validation_pipeline' in p and LooseVersion(p) >= LooseVersion(skeleton_path):
+            skeleton_path = p
+    if skeleton_path == '0':
+        print("ERROR: could not find skeleton files in python path")
+        sys.exit(1)
+    shutil.copytree(
+        skeleton_path + '/project-skeleton/validation_pipeline',
+        args.path[0] + '/validation_pipeline',
+        ignore=shutil.ignore_patterns('*.pyc')
+    )
+    orig_path = os.getcwd()
+    os.chdir(args.path[0] + '/validation_pipeline')
+    basepath = './'
+    if not os.path.exists(basepath + 'demo_source.zip'):
+        ziph = zipfile.ZipFile('./demo_source.zip', 'w', zipfile.ZIP_DEFLATED)
+        os.chdir('./demo_source')
+        for root, dirs, files in os.walk('./'):
+            for f in files:
+                ziph.write(os.path.join(root, f))
+        ziph.close()
+    os.chdir('../')
+    shutil.rmtree('./demo_source')
+    os.chdir(orig_path)

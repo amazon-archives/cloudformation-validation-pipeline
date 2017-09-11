@@ -1,0 +1,14 @@
+global:
+  regions:
+    - ap-northeast-1
+    - eu-central-1
+    - eu-west-1
+    - us-east-1
+    - us-east-2
+tests:
+  defaults:
+    regions:
+      - eu-west-1
+      - us-east-1
+    parameter_input: aws-vpc-defaults.json
+    template_file: aws-vpc.template

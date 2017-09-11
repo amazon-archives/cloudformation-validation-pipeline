@@ -1,0 +1,378 @@
+#! /usr/bin/env python
+import argparse
+import boto3
+from distutils.dir_util import copy_tree
+from hashlib import sha1
+import os
+import pip
+import platform
+import shutil
+import zipfile
+import subprocess
+import sys
+
+
+def zip_function(function_path, output_path='./lambda_functions/'):
+    """zips function code for import to AWS lambda
+
+    """
+    orig_path = os.getcwd()
+    os.chdir(output_path)
+    function_path = os.path.normpath(function_path)
+    zip_name = os.path.split(function_path)[1] + '.zip'
+    zip_file = zipfile.ZipFile(zip_name, mode='a')
+    os.chdir(orig_path)
+    os.chdir(function_path)
+    for folder, subs, files in os.walk('./'):
+        for filename in files:
+            fpath = os.path.join(folder, filename)
+            if fpath.endswith('.py') or '.so' in fpath:
+                zip_file.write(fpath)
+    zip_file.close()
+    os.chdir(orig_path)
+    return
+
+
+def folder_checksum(function_path):
+    """creates a checksum for all files in a lambda zip
+
+    """
+    hash_sha1 = sha1()
+    orig_path = os.getcwd()
+    os.chdir(function_path)
+    for folder, subs, files in os.walk('./'):
+        for filename in files:
+            fpath = os.path.join(folder, filename)
+            if fpath.endswith('.py') or '.so' in fpath:
+                with open(fpath, "rb") as f:
+                    for chunk in iter(lambda: f.read(4096), b""):
+                        hash_sha1.update(chunk)
+    os.chdir(orig_path)
+    return hash_sha1.hexdigest()
+
+
+def get_deps(function_path, lib_path='./lambda_functions/lib'):
+    """get dependencies in requirements.txt
+
+    """
+
+    function_path = os.path.normpath(function_path)
+    lib_path = os.path.normpath(lib_path)
+    local_pkgs = [
+        f for f in os.listdir(lib_path)
+        if (os.path.isfile(os.path.join(lib_path, f)) and f.endswith('.py'))
+        or (os.path.isdir(os.path.join(lib_path, f)))
+    ]
+    if os.path.isfile(os.path.join(function_path, 'requirements.txt')):
+        f = open(os.path.join(function_path, 'requirements.txt'), 'r')
+        for dep in f.readlines():
+            dep = dep.replace('\n', '')
+            if dep == 'pygit2' and dep not in local_pkgs:
+                build_libgit2(lib_path)
+                copy_tree(os.path.join(lib_path, dep), function_path)
+            elif dep == 'pyyaml' and dep not in local_pkgs:
+                if platform.system() != 'Linux':
+                    install_module(['install', '--global-option', '--without-libyaml', '--upgrade', '--target', os.path.join(lib_path, dep), dep], lib_path)
+                else:
+                    install_module(['install', '--upgrade', '--target', os.path.join(lib_path, dep), dep], lib_path)
+                copy_tree(os.path.join(lib_path, dep), function_path)
+            elif dep + '.py' in local_pkgs:
+                dep = dep + '.py'
+                shutil.copyfile(os.path.join(lib_path, dep), os.path.join(function_path, dep))
+            elif dep in local_pkgs:
+                copy_tree(os.path.join(lib_path, dep), function_path)
+            else:
+                install_module(['install', '--upgrade', '--target', os.path.join(lib_path, dep), dep], lib_path)
+                copy_tree(os.path.join(lib_path, dep), function_path)
+        f.close()
+    return
+
+
+def install_module(pip_args, lib_path=None, exit_on_error=True):
+    dep = pip_args[-1]
+    if lib_path:
+        try:
+            os.mkdir(os.path.join(lib_path, dep))
+        except Exception as e:
+            if str(e).startswith('[Errno 17] File exists:'):
+                pass
+            else:
+                raise
+    rc = pip.main(pip_args)
+    if rc != 0:
+        if lib_path:
+            shutil.rmtree(os.path.join(lib_path, dep))
+        print('ERROR: pip failed to install %s' % pip_args[-1])
+        if exit_on_error:
+            sys.exit(rc)
+    return rc
+
+
+
+
+def run_command(command, raise_on_err=False):
+    print("Running shell command: %s" % command)
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    stdout, stderr = proc.communicate()
+    if raise_on_err:
+        if proc.returncode != 0 or stderr != '':
+            print('ERROR: process exited %s' % proc.returncode)
+            for l in stdout.split('\n') + stderr.split('\n'):
+                print(l)
+            sys.exit(1)
+    return proc.returncode, stdout, stderr
+
+def build_libgit2(lib_path):
+    libgit2_path = os.path.join(lib_path, 'pygit2')
+    try:
+        os.mkdir(libgit2_path)
+    except Exception as e:
+        if str(e).startswith('[Errno 17] File exists:'):
+            pass
+        else:
+            raise
+    try:
+        packages = 'curl wget jq gcc cmake libffi-devel openssl-devel http-parser-devel'
+        for p in ['yum','rpm']:
+            rc, stdout, stderr = run_command(p + ' --version')
+            if rc != 0:
+                print('ERROR: building libgit2 requires yum to install required packages')
+                shutil.rmtree(libgit2_path)
+                sys.exit(1)
+        rc, stdout, stderr = run_command('rpm --query --queryformat "" ' + packages)
+        if stdout != '':
+            rc, stdout, stderr = run_command('yum install --setopt skip_missing_names_on_install=False -y ' + packages)
+            if stderr != '' or rc != 0:
+                if 'You need to be root to perform this command' in stderr:
+                    print('ERROR: building libgit2 requires root access to install required packages')
+                    print('either run this as root, or install the following packages before running this command')
+                    print(packages)
+                    shutil.rmtree(libgit2_path)
+                    sys.exit(1)
+                elif rc == 0 and 'Main config did not have a skip_missing_names_on_install attr. before setopt' in stderr:
+                    pass
+                else:
+                    for l in stdout.split('\n') + stderr.split('\n'):
+                        print(l)
+                    shutil.rmtree(libgit2_path)
+                    print("ERROR: yum install command failed.")
+                    sys.exit(1)
+        rc, stdout, stderr = run_command('curl https://api.github.com/repos/libgit2/libgit2/releases/latest | jq -r ".tarball_url"')
+        if rc != 0:
+            for l in stdout.split('\n') + stderr.split('\n'):
+                print(l)
+            shutil.rmtree(libgit2_path)
+            sys.exit(1)
+        run_command('wget -q -O libgit2_latest.tgz ' + stdout.replace('\n', ''), True)
+        rc, stdout, stderr = run_command("tar -xvf libgit2_latest.tgz | tail -n 1 | awk -F / '{print $1}'", True)
+        build_path = stdout.replace('\n','')
+        os.chdir(build_path)
+        run_command('cmake .', True)
+        run_command('make', True)
+        run_command('make install', True)
+        rc, stdout, stderr = run_command("find ./ -maxdepth 1 -type f -name 'libgit2.so*'")
+        libgit2_file = stdout.replace('\n', '').replace('./', '')
+        rc, stdout, stderr = run_command("find ./ -maxdepth 1 -type l -name 'libgit2.so.*'")
+        os.chdir('../')
+        for s in stdout.split('\n'):
+            if s != '':
+                s = s.replace('./', '')
+                shutil.copy2(os.path.join(build_path, libgit2_file), os.path.join(libgit2_path, s))
+        shutil.copy2('/usr/lib64/libhttp_parser.so.2.0', os.path.join(libgit2_path, 'libhttp_parser.so.2'))
+        rc = install_module(['install', '--upgrade', '--target', libgit2_path, 'pygit2'], lib_path, False)
+        shutil.rmtree(build_path)
+        os.remove('libgit2_latest.tgz')
+        if rc != 0:
+            sys.exit(rc)
+    except Exception:
+        try:
+            shutil.rmtree(build_path)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(libgit2_path)
+        except Exception:
+            pass
+        try:
+            os.remove('libgit2_latest.tgz')
+        except Exception:
+            pass
+        raise
+
+def get_regions(services=['codepipeline', 'codecommit', 'codebuild', 'lambda', 'events']):
+    service_regions = []
+    session = boto3.session.Session()
+    for service in services:
+        service_regions.append(session.get_available_regions(service))
+    regions = []
+    for service in service_regions:
+        for r in service:
+            if len([i for i in service_regions if r in i]) == len(service_regions) and r not in regions:
+                regions.append(r)
+    return regions
+
+
+if __name__ == "__main__":
+
+    if platform.system() != 'Linux':
+        print('WARNING: as you are not running linux, any binary dependencies will be built for the wrong platform')
+    if platform.release() != '4.4.11-23.53.amzn1.x86_64':
+        print('WARNING: for best compatibility with the lambda runtime environment run this from an ec2 instance using the amzn-ami-hvm-2016.03.3.x86_64-gp2 AMI')
+
+    parser = argparse.ArgumentParser(
+        description='Deployment tool for AWS CloudFormation Template Validation Pipeline.'
+    )
+    parser.add_argument('bucket_name', type=str, nargs=1,
+                        help='S3 bucket name prefix (region will be appended to it, unless --absolute is set) to upload templates and function zips to, if the bucket(s) does not exist it will be created')
+    parser.add_argument('-k', '--key-prefix', type=str, default='dev',
+                        help='S3 key prefix to use, defaults to "dev"')
+    parser.add_argument('-v', '--version', type=str, default="1",
+                        help='version number to use as last part of the S3 key, defaults to 1')
+    parser.add_argument('-p', '--path', type=str, default='./',
+                        help='path to cicd project, defaults to the current folder')
+    parser.add_argument('-a', '--acl', type=str, default='private',
+                        help='acl for objects in s3, valid values are private, authenticated-read or public-read. defaults to private')
+    parser.add_argument('-r', '--region', type=str, default='us-east-1',
+                        help='region for deployment s3 bucket')
+    parser.add_argument('-m', '--multi-region', action='store_true',
+                        help='if specified will deploy to buckets in all supported regions, using the region name as a suffix to the provided bucket name')
+    parser.add_argument('-b', '--absolute', action='store_true',
+                        help='do not append the region to the bucket name')
+    parser.add_argument('-s', '--skip-s3', action='store_true',
+                        help='do not push deployment files to s3')
+    parser.add_argument('-d', '--dest-path', type=str, default='./build/',
+                        help='path for local build output, only used if --skip-s3 is specified, defaults to ./build/')
+    parser.add_argument('-f', '--flat', action='store_true',
+                        help='do not create a folder structure and store all files in the same folder')
+    parser.add_argument('-e', '--demo', action='store_true',
+                        help='build the demo template and requirements')
+    parser.add_argument('-P', '--profile', type=str, default=None,
+                        help='aws cli profile to use')
+    args = parser.parse_args()
+
+    if args.profile:
+        boto3.setup_default_session(profile_name=args.profile)
+
+    key_prefix = args.key_prefix
+    if not key_prefix.endswith('/') and not key_prefix == '':
+        key_prefix = key_prefix + '/'
+    version_number = args.version
+
+    os.chdir(args.path)
+
+    # delete old build directory, if it exists
+    shutil.rmtree(args.dest_path, ignore_errors=True)
+
+    for file_path in os.listdir("./lambda_functions/"):
+        file_path = "./lambda_functions/" + file_path
+        if os.path.isdir(file_path) and file_path != './lambda_functions/lib':
+            if not (not args.demo and os.path.normpath(file_path).endswith('/git_pull')):
+                get_deps(file_path)
+                lastchecksum = None
+                if os.path.isfile(file_path + '.zip'):
+                    if os.path.isfile(file_path + '/.checksum'):
+                        f = open(file_path + '/.checksum', 'r')
+                        lastchecksum = f.readline()
+                        f.close()
+                checksum = folder_checksum(file_path)
+                if checksum != lastchecksum:
+                    f = open(file_path + '/.checksum', 'w')
+                    f.write(checksum)
+                    f.close()
+                    if os.path.isfile(file_path + '.zip'):
+                        os.remove(file_path + '.zip')
+                    zip_function(file_path)
+
+    if args.multi_region:
+        regions = get_regions()
+    else:
+        regions = [args.region]
+    for region in regions:
+        s3_client = boto3.client('s3', region_name=region)
+        if args.absolute:
+            bucket = args.bucket_name[0]
+            bucket_prefix = bucket
+            absolute = 'Yes'
+        else:
+            if args.bucket_name[0].endswith('-'):
+                    bucket_prefix = args.bucket_name[0]
+            else:
+                bucket_prefix = args.bucket_name[0] + '-'
+            bucket = bucket_prefix + region
+            absolute = 'No'
+        if not args.skip_s3:
+            try:
+                s3_client.head_bucket(Bucket=bucket)
+            except Exception:
+                print("Creating non-existent bucket %s" % bucket)
+                if region != 'us-east-1':
+                    s3_client.create_bucket(Bucket=bucket, CreateBucketConfiguration={'LocationConstraint': region})
+                else:
+                    s3_client.create_bucket(Bucket=bucket)
+        upload_list = []
+        for filename in os.listdir('./cloudformation/'):
+            if filename.endswith(".template"):
+                file_path = os.path.join("./cloudformation/", filename)
+                with open(file_path, 'r') as file:
+                    filedata = file.read()
+                filedata = filedata.replace("${bucket_prefix}", bucket_prefix)
+                filedata = filedata.replace("${key_prefix}", key_prefix)
+                filedata = filedata.replace("${version_number}", version_number)
+                filedata = filedata.replace("${absolute_bucket}", absolute)
+                if args.flat:
+                    filedata = filedata.replace("cloudformation/", '')
+                    filedata = filedata.replace("lambda_functions/", '')
+                file_path = os.path.join("/tmp/", filename)
+                with open(file_path, 'w') as file:
+                    file.write(filedata)
+                checksum = sha1(open(file_path, 'rb').read()).hexdigest()
+                if not (not args.demo and filename in ['aws-cloudformation-validation-pipeline.template', 'aws-service-catalog-validation-pipeline.template']):
+                    upload_list.append([file_path, key_prefix + version_number + '/' + 'cloudformation/' + filename, checksum])
+        for filename in os.listdir("./lambda_functions/"):
+            if filename.endswith(".zip"):
+                file_path = os.path.join("./lambda_functions/", filename)
+                checksum = sha1(open(file_path, 'rb').read()).hexdigest()
+                upload_list.append([file_path, key_prefix + version_number + '/' + 'lambda_functions/' + filename, checksum])
+        if args.demo:
+            filename = 'demo_source.zip'
+            file_path = os.path.join("./", filename)
+            checksum = sha1(open(file_path, 'rb').read()).hexdigest()
+            upload_list.append(
+                [file_path, key_prefix + version_number + '/' + filename, checksum])
+        if args.skip_s3:
+            if args.dest_path.endswith('/'):
+                dest_path = args.dest_path
+            else:
+                dest_path = args.dest_path + '/'
+            os.mkdir(dest_path)
+            if not args.flat:
+                os.mkdir(dest_path + 'cloudformation/')
+                os.mkdir(dest_path + 'lambda_functions/')
+        for ul in upload_list:
+            try:
+                old_checksum = s3_client.head_object(Bucket=bucket, Key=ul[1])['Metadata']['sha1']
+            except Exception:
+                old_checksum = None
+            if args.skip_s3:
+                if args.dest_path.endswith('/'):
+                    dest_path = args.dest_path
+                else:
+                    dest_path = args.dest_path + '/'
+                if ul[0].startswith('/tmp/'):
+                    dest_path = dest_path + 'cloudformation/' + ul[0][len('/tmp/'):]
+                else:
+                    dest_path = dest_path + ul[0]
+                if args.flat:
+                    dest_path = dest_path.replace('cloudformation/', '').replace('lambda_functions/', '')
+                shutil.copy(ul[0], dest_path)
+            else:
+                if ul[2] != old_checksum:
+                    if args.flat:
+                        ul[1] = ul[1].replace('cloudformation/', '').replace('lambda_functions/', '')
+                    print("Uploading s3://%s/%s" % (bucket, ul[1]))
+                    s3_client.upload_file(ul[0], bucket, ul[1], ExtraArgs={"ACL": args.acl, "Metadata": {"sha1": ul[2]}})
+                else:
+                    print("Updating acl s3://%s/%s" % (bucket, ul[1]))
+                    s3_client.put_object_acl(ACL=args.acl, Bucket=bucket, Key=ul[1])
+                if ul[1].endswith('demo_source.zip'):
+                    s3_client.put_object_acl(ACL='public-read', Bucket=bucket, Key=ul[1])

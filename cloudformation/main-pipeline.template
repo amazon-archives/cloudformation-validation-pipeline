@@ -1,0 +1,2612 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "Creates pipelines and required roles to provide CI/CD for CloudFormation templates",
+    "Metadata": {
+        "AWS::CloudFormation::Interface": {
+            "ParameterGroups": [
+                {
+                    "Label": {
+                        "default": "Source Settings"
+                    },
+                    "Parameters": [
+                        "CodeCommitRepoName",
+                        "SourceRepoBranch"
+                    ]
+                },
+                {
+                    "Label": {
+                        "default": "Notification Settings"
+                    },
+                    "Parameters": [
+                        "EmailPrimary",
+                        "EmailSecondary"
+                    ]
+                },
+                {
+                    "Label": {
+                        "default": "Deployment Settings"
+                    },
+                    "Parameters": [
+                        "ManualApproval"
+                    ]
+                },
+                {
+                    "Label": {
+                        "default": "Stack Creation Settings"
+                    },
+                    "Parameters": [
+                        "StackCreationRoleArn",
+                        "CleanupNonFailed",
+                        "CleanupSuccessOlder",
+                        "CleanupPrevious",
+                        "CleanupFailed",
+                        "CleanupFailedOlder"
+                    ]
+                },
+                {
+                    "Label": {
+                        "default": "Logical (pre-stack-create) Tests"
+                    },
+                    "Parameters": [
+                        "PreCreateTest1",
+                        "PreCreateTest2",
+                        "PreCreateTest3",
+                        "PreCreateTest4"
+                    ]
+                },
+                {
+                    "Label": {
+                        "default": "Functional (post-stack-create) Tests"
+                    },
+                    "Parameters": [
+                        "PostCreateTest1",
+                        "PostCreateTest2",
+                        "PostCreateTest3",
+                        "PostCreateTest4"
+                    ]
+                }
+            ],
+            "ParameterLabels": {
+                "CleanupFailed": {
+                    "default": "Delete Failed Stacks"
+                },
+                "CleanupFailedOlder": {
+                    "default": "Retention Period: Failed Stacks"
+                },
+                "CleanupNonFailed": {
+                    "default": "Delete Successful Stacks"
+                },
+                "CleanupPrevious": {
+                    "default": "Delete Previous Stacks"
+                },
+                "CleanupSuccessOlder": {
+                    "default": "Retention Period: Successful Stacks"
+                },
+                "CodeCommitRepoName": {
+                    "default": "Repository Name"
+                },
+                "EmailPrimary": {
+                    "default": "Primary Email"
+                },
+                "EmailSecondary": {
+                    "default": "Secondary Email"
+                },
+                "ManualApproval": {
+                    "default": "Manual Approval"
+                },
+                "PostCreateTest1": {
+                    "default": "1st Test"
+                },
+                "PostCreateTest2": {
+                    "default": "2nd Test"
+                },
+                "PostCreateTest3": {
+                    "default": "3rd Test"
+                },
+                "PostCreateTest4": {
+                    "default": "4th Test"
+                },
+                "PreCreateTest1": {
+                    "default": "1st Test"
+                },
+                "PreCreateTest2": {
+                    "default": "2nd Test"
+                },
+                "PreCreateTest3": {
+                    "default": "3rd Test"
+                },
+                "PreCreateTest4": {
+                    "default": "4th Test"
+                },
+                "SourceRepoBranch": {
+                    "default": "Branch"
+                },
+                "StackCreationRoleArn": {
+                    "default": "Create Stack Role ARN"
+                }
+            }
+        }
+    },
+    "Mappings": {
+        "Functions": {
+            "Notification": {
+                "S3Key": "lambda_functions/email_notification.zip",
+                "Handler": "email_notification"
+            },
+            "Cleanup": {
+                "S3Key": "lambda_functions/stack_cleanup.zip",
+                "Handler": "stack_cleanup"
+            },
+            "DeleteBucketContents": {
+                "LogLevel": "debug"
+            },
+            "AnonymousReporting": {
+                "S3Key": "lambda_functions/anon_reporting.zip",
+                "Handler": "anon_reporting"
+            },
+            "CleanupStacks": {
+                "S3Key": "lambda_functions/cleanup_on_stack_delete.zip",
+                "Handler": "cleanup_on_stack_delete"
+            }
+        },
+        "General": {
+            "CIConfig": {
+                "CITestPath": "ci"
+            },
+            "CodeRepo": {
+                "S3BucketPrefix": "${bucket_prefix}",
+                "S3KeyPrefix": "${key_prefix}${version_number}/"
+            },
+            "Prefix": {
+                "DeployKey": "builds/",
+                "ReportKey": "reports/"
+            },
+            "SendAnonymousData": {
+                "Enabled": "Yes"
+            },
+            "AbsoluteBucketName": {
+                "Enabled": "${absolute_bucket}"
+            }
+        }
+    },
+    "Parameters": {
+        "CleanupFailed": {
+            "AllowedValues": [
+                "Yes",
+                "No"
+            ],
+            "Default": "No",
+            "Description": "Delete stacks that are in a failed state",
+            "Type": "String"
+        },
+        "CleanupFailedOlder": {
+            "AllowedValues": [
+                "Disabled",
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "14",
+                "30",
+                "60",
+                "90"
+            ],
+            "Default": "4",
+            "Description": "Delete failed stacks that are older than x days",
+            "Type": "String"
+        },
+        "CleanupNonFailed": {
+            "AllowedValues": [
+                "Yes",
+                "No"
+            ],
+            "Default": "Yes",
+            "Description": "When any stack fails, delete all other stacks that are in a complete or in progress state",
+            "Type": "String"
+        },
+        "CleanupPrevious": {
+            "AllowedValues": [
+                "Yes",
+                "No"
+            ],
+            "Default": "Yes",
+            "Description": "Delete stacks from previous pipeline executions before creating new stacks",
+            "Type": "String"
+        },
+        "CleanupSuccessOlder": {
+            "AllowedValues": [
+                "Disabled",
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "14",
+                "30",
+                "60",
+                "90"
+            ],
+            "Default": "2",
+            "Description": "Delete successful stacks that are older than x days",
+            "Type": "String"
+        },
+        "CodeCommitRepoName": {
+            "Default": "quickstart-aws-vpc",
+            "Description": "Name of CodeCommit Repository to use as pipeline source",
+            "Type": "String"
+        },
+        "EmailPrimary": {
+            "AllowedPattern": "^$|^[a-zA-Z0-9_\\-\\.]+@[a-zA-Z0-9_\\-\\.]+\\.[a-zA-Z\\.]+[a-zA-Z]+$",
+            "Default": "",
+            "Description": "Primary email to notify for pending manual approvals and pipeline execution notifications",
+            "Type": "String"
+        },
+        "EmailSecondary": {
+            "AllowedPattern": "^$|^[a-zA-Z0-9_\\-\\.]+@[a-zA-Z0-9_\\-\\.]+\\.[a-zA-Z\\.]+[a-zA-Z]+$",
+            "Default": "",
+            "Description": "Secondary email to notify for pending manual approvals and pipeline execution notifications",
+            "Type": "String"
+        },
+        "ManualApproval": {
+            "AllowedValues": [
+                "Yes",
+                "No"
+            ],
+            "Default": "Yes",
+            "Description": "Require manual approval before deploying templates, will email Primary Email and (optionally) Secondary Email specified in the Email Notification Settings section",
+            "Type": "String"
+        },
+        "PostCreateTest1": {
+            "Default": "",
+            "Description": "name for 1st post-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "PostCreateTest2": {
+            "Default": "",
+            "Description": "name for 2nd post-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "PostCreateTest3": {
+            "Default": "",
+            "Description": "name for 3rd post-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "PostCreateTest4": {
+            "Default": "",
+            "Description": "name for 4th post-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "PreCreateTest1": {
+            "Default": "",
+            "Description": "name for 1st pre-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "PreCreateTest2": {
+            "Default": "",
+            "Description": "name for 2nd pre-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "PreCreateTest3": {
+            "Default": "",
+            "Description": "name for 3rd pre-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "PreCreateTest4": {
+            "Default": "",
+            "Description": "name for 4th pre-stack-creation test lambda function (optional)",
+            "Type": "String"
+        },
+        "SourceRepoBranch": {
+            "Default": "master",
+            "Description": "Name of branch to use as pipeline source",
+            "Type": "String"
+        },
+        "StackCreationRoleArn": {
+            "Description": "Role used to launch CloudFormation stacks",
+            "Type": "String"
+        }
+    },
+    "Conditions": {
+        "CleanupFailedOlder": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "CleanupFailedOlder"
+                        },
+                        "Disabled"
+                    ]
+                }
+            ]
+        },
+        "CleanupOlder": {
+            "Fn::Or": [
+                {
+                    "Fn::Not": [
+                        {
+                            "Fn::Equals": [
+                                {
+                                    "Ref": "CleanupSuccessOlder"
+                                },
+                                "Disabled"
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "Fn::Not": [
+                        {
+                            "Fn::Equals": [
+                                {
+                                    "Ref": "CleanupFailedOlder"
+                                },
+                                "Disabled"
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        "CleanupSuccessOlder": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "CleanupSuccessOlder"
+                        },
+                        "Disabled"
+                    ]
+                }
+            ]
+        },
+        "EmailPrimary": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "EmailPrimary"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EmailSecondary": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "EmailSecondary"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnableAnonReporting": {
+            "Fn::Equals": [
+                {
+                    "Fn::FindInMap": [
+                        "General",
+                        "SendAnonymousData",
+                        "Enabled"
+                    ]
+                },
+                "Yes"
+            ]
+        },
+        "EnablePostCreateTest1": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PostCreateTest1"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnablePostCreateTest2": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PostCreateTest2"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnablePostCreateTest3": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PostCreateTest3"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnablePostCreateTest4": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PostCreateTest4"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnablePreCreateTest1": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PreCreateTest1"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnablePreCreateTest2": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PreCreateTest2"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnablePreCreateTest3": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PreCreateTest3"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "EnablePreCreateTest4": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "PreCreateTest4"
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "ManualApproval": {
+            "Fn::Equals": [
+                {
+                    "Ref": "ManualApproval"
+                },
+                "Yes"
+            ]
+        },
+        "UseRelativeBucket": {
+            "Fn::Equals": [
+                {
+                    "Fn::FindInMap": [
+                        "General",
+                        "AbsoluteBucketName",
+                        "Enabled"
+                    ]
+                },
+                "No"
+            ]
+        }
+    },
+    "Resources": {
+        "DeployBucket": {
+            "Type": "AWS::S3::Bucket"
+        },
+        "KeyBucket": {
+            "Type": "AWS::S3::Bucket"
+        },
+        "CleanupSchedule": {
+            "Type": "AWS::Events::Rule",
+            "Properties": {
+                "Description": {
+                    "Fn::Join": [
+                        "-",
+                        [
+                            "CleanupSchedule",
+                            {
+                                "Ref": "AWS::Region"
+                            },
+                            {
+                                "Ref": "AWS::StackName"
+                            }
+                        ]
+                    ]
+                },
+                "ScheduleExpression": "rate(1 hour)",
+                "State": "ENABLED",
+                "Targets": [
+                    {
+                        "Fn::If": [
+                            "CleanupFailedOlder",
+                            {
+                                "Arn": {
+                                    "Fn::GetAtt": [
+                                        "CleanupLambda",
+                                        "Arn"
+                                    ]
+                                },
+                                "Id": "CleanupFailedTarget",
+                                "Input": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "{\"pipeline\": \"",
+                                            {
+                                                "Ref": "CodePipeline"
+                                            },
+                                            "\", \"region\": \"",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "\", \"age\": ",
+                                            {
+                                                "Ref": "CleanupFailedOlder"
+                                            },
+                                            ", \"failed\": true, \"latest\": false}"
+                                        ]
+                                    ]
+                                }
+                            },
+                            {
+                                "Ref": "AWS::NoValue"
+                            }
+                        ]
+                    },
+                    {
+                        "Fn::If": [
+                            "CleanupSuccessOlder",
+                            {
+                                "Arn": {
+                                    "Fn::GetAtt": [
+                                        "CleanupLambda",
+                                        "Arn"
+                                    ]
+                                },
+                                "Id": "CleanupSuccessTarget",
+                                "Input": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "{\"pipeline\": \"",
+                                            {
+                                                "Ref": "CodePipeline"
+                                            },
+                                            "\", \"region\": \"",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "\", \"age\": ",
+                                            {
+                                                "Ref": "CleanupSuccessOlder"
+                                            },
+                                            ", \"failed\": false, \"latest\": false}"
+                                        ]
+                                    ]
+                                }
+                            },
+                            {
+                                "Ref": "AWS::NoValue"
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        "CleanupPermissions": {
+            "Condition": "CleanupOlder",
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Ref": "CleanupLambda"
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "events.amazonaws.com",
+                "SourceArn": {
+                    "Fn::GetAtt": [
+                        "CleanupSchedule",
+                        "Arn"
+                    ]
+                }
+            }
+        },
+        "CleanupRole": {
+            "Condition": "CleanupOlder",
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "scheduledcleanup",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "iam:GetRole",
+                                        "iam:CreateRole",
+                                        "iam:AttachRolePolicy",
+                                        "iam:PassRole"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:iam::${AWS::AccountId}:role/TemplateCI-StackCleanUp"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "cloudformation:DeleteStack",
+                                        "cloudformation:DescribeStacks",
+                                        "cloudformation:ListStacks"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/ci-*"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "cloudformation:ListStacks"
+                                    ],
+                                    "Resource": [
+                                        "*"
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "codepipeline:GetPipeline",
+                                        "codepipeline:GetPipelineState"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:*"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "codepipeline:ListPipelines"
+                                    ],
+                                    "Resource": [
+                                        "*"
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "ec2:DescribeKeyPairs",
+                                        "ec2:DeleteKeyPair"
+                                    ],
+                                    "Resource": [
+                                        "*"
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "CleanupLambda": {
+            "Condition": "CleanupOlder",
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Handler": {
+                    "Fn::Join": [
+                        ".",
+                        [
+                            {
+                                "Fn::FindInMap": [
+                                    "Functions",
+                                    "Cleanup",
+                                    "Handler"
+                                ]
+                            },
+                            "lambda_handler"
+                        ]
+                    ]
+                },
+                "MemorySize": "512",
+                "Role": {
+                    "Fn::GetAtt": [
+                        "CleanupRole",
+                        "Arn"
+                    ]
+                },
+                "Runtime": "python2.7",
+                "Timeout": "300",
+                "Code": {
+                    "S3Bucket": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3BucketPrefix"
+                                    ]
+                                },
+                                {
+                                "Fn::If": [
+                                    "UseRelativeBucket",
+                                    {
+                                        "Ref": "AWS::Region"
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            }
+                            ]
+                        ]
+                    },
+                    "S3Key": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3KeyPrefix"
+                                    ]
+                                },
+                                {
+                                    "Fn::FindInMap": [
+                                        "Functions",
+                                        "Cleanup",
+                                        "S3Key"
+                                    ]
+                                }
+                            ]
+                        ]
+                    }
+                }
+            }
+        },
+        "ArtifactBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "AccessControl": "Private",
+                "LifecycleConfiguration": {
+                    "Rules": [
+                        {
+                            "NoncurrentVersionExpirationInDays": 30,
+                            "Status": "Enabled"
+                        }
+                    ]
+                },
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                }
+            }
+        },
+        "ScratchBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "AccessControl": "Private"
+            }
+        },
+        "DeleteBucketContentsRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "deletebucketcontents",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "s3:*"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${ArtifactBucket}/*"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${ArtifactBucket}"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${ScratchBucket}/*"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${ScratchBucket}"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${KeyBucket}/*"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${KeyBucket}"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${DeployBucket}/*"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${DeployBucket}"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "DeleteBucketContentsLambda": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Handler": "index.lambda_handler",
+                "MemorySize": "128",
+                "Role": {
+                    "Fn::GetAtt": [
+                        "DeleteBucketContentsRole",
+                        "Arn"
+                    ]
+                },
+                "Runtime": "python2.7",
+                "Timeout": "300",
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": [
+                            "\n",
+                            [
+                                "import cfnresponse",
+                                "import traceback",
+                                "import boto3",
+                                "",
+                                "def lambda_handler(event,context):",
+                                "    try:",
+                                "        if event['RequestType'] == 'Delete':",
+                                "            s3 = boto3.client('s3')",
+                                "            print 'Getting Bucket objects...'",
+                                "            objects=[]",
+                                "            for bucket in event['ResourceProperties']['Buckets'].split(','):",
+                                "              versions=s3.list_object_versions(Bucket=bucket)",
+                                "              while versions:",
+                                "                if 'Versions' in versions.keys():",
+                                "                    for v in versions['Versions']:",
+                                "                        objects.append({'Key':v['Key'],'VersionId': v['VersionId']})",
+                                "                if 'DeleteMarkers'in versions.keys():",
+                                "                    for v in versions['DeleteMarkers']:",
+                                "                        objects.append({'Key':v['Key'],'VersionId': v['VersionId']})",
+                                "                if versions['IsTruncated']:",
+                                "                    versions=s3.list_object_versions(Bucket=bucket,VersionIdMarker=versions['NextVersionIdMarker'])",
+                                "                else:",
+                                "                    versions=False",
+                                "              if objects != []:",
+                                "                s3.delete_objects(Bucket=bucket,Delete={'Objects':objects})",
+                                "        cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, '')",
+                                "    except:",
+                                "        print traceback.print_exc()",
+                                "        cfnresponse.send(event, context, cfnresponse.FAILED, {}, '')"
+                            ]
+                        ]
+                    }
+                }
+            }
+        },
+        "DeleteBucketContents": {
+            "Type": "AWS::CloudFormation::CustomResource",
+            "Version": "1.0",
+            "DependsOn": [
+                "ArtifactBucket",
+                "ScratchBucket"
+            ],
+            "Properties": {
+                "ServiceToken": {
+                    "Fn::GetAtt": [
+                        "DeleteBucketContentsLambda",
+                        "Arn"
+                    ]
+                },
+                "Buckets": {
+                    "Fn::Join": [
+                        ",",
+                        [
+                            {
+                                "Ref": "ArtifactBucket"
+                            },
+                            {
+                                "Ref": "ScratchBucket"
+                            },
+                            {
+                                "Ref": "DeployBucket"
+                            },
+                            {
+                                "Ref": "KeyBucket"
+                            }
+                        ]
+                    ]
+                },
+                "loglevel": {
+                    "Fn::FindInMap": [
+                        "Functions",
+                        "DeleteBucketContents",
+                        "LogLevel"
+                    ]
+                }
+            }
+        },
+        "CodePipelineServiceRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "codepipeline.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "CFN-CICD-CodePipelineService",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Fn::If": [
+                                        "ManualApproval",
+                                        {
+                                            "Action": [
+                                                "sns:Publish"
+                                            ],
+                                            "Resource": [
+                                                {
+                                                    "Ref": "SNSTopic"
+                                                }
+                                            ],
+                                            "Effect": "Allow"
+                                        },
+                                        {
+                                            "Ref": "AWS::NoValue"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Action": [
+                                        "s3:GetObject",
+                                        "s3:GetObjectVersion",
+                                        "s3:GetBucketVersioning",
+                                        "s3:PutObject"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${ArtifactBucket}"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::${ArtifactBucket}/*"
+                                        }
+                                    ],
+                                    "Effect": "Allow"
+                                },
+                                {
+                                    "Action": [
+                                        "codeCommit:GetUploadArchiveStatus",
+                                        "codecommit:CancelUploadArchive",
+                                        "codecommit:GetBranch",
+                                        "codecommit:GetCommit",
+                                        "codecommit:GetUploadStatus",
+                                        "codecommit:UploadArchive"
+                                    ],
+                                    "Resource": {
+                                        "Fn::Join": [
+                                            ":",
+                                            [
+                                                "arn:aws:codecommit",
+                                                {
+                                                    "Ref": "AWS::Region"
+                                                },
+                                                {
+                                                    "Ref": "AWS::AccountId"
+                                                },
+                                                {
+                                                    "Ref": "CodeCommitRepoName"
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "Effect": "Allow"
+                                },
+                                {
+                                    "Action": "lambda:ListFunctions",
+                                    "Resource": "*",
+                                    "Effect": "Allow"
+                                },
+                                {
+                                    "Action": "lambda:InvokeFunction",
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Validate_Template"
+                                        },
+                                        {
+                                            "Fn::Sub": [
+                                                "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DeployToS3LambdaName}",
+                                                {
+                                                    "DeployToS3LambdaName": {
+                                                        "Fn::ImportValue": "DeployToS3LambdaName"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::Sub": [
+                                                "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateStacksLambdaName}",
+                                                {
+                                                    "CreateStacksLambdaName": {
+                                                        "Fn::ImportValue": "CreateStacksLambdaName"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::Sub": [
+                                                "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${GenerateReportLambdaName}",
+                                                {
+                                                    "GenerateReportLambdaName": {
+                                                        "Fn::ImportValue": "GenerateReportLambdaName"
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePreCreateTest1",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PreCreateTest1}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePreCreateTest2",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PreCreateTest2}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePreCreateTest3",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PreCreateTest3}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePreCreateTest4",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PreCreateTest4}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePostCreateTest1",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PostCreateTest1}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePostCreateTest2",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PostCreateTest2}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePostCreateTest3",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PostCreateTest3}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "Fn::If": [
+                                                "EnablePostCreateTest4",
+                                                {
+                                                    "Fn::Sub": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PostCreateTest4}"
+                                                },
+                                                {
+                                                    "Ref": "AWS::NoValue"
+                                                }
+                                            ]
+                                        }
+                                    ],
+                                    "Effect": "Allow"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "CodePipeline": {
+            "Type": "AWS::CodePipeline::Pipeline",
+            "Properties": {
+                "RoleArn": {
+                    "Fn::GetAtt": [
+                        "CodePipelineServiceRole",
+                        "Arn"
+                    ]
+                },
+                "ArtifactStore": {
+                    "Type": "S3",
+                    "Location": {
+                        "Ref": "ArtifactBucket"
+                    }
+                },
+                "Stages": [
+                    {
+                        "Name": "Source",
+                        "Actions": [
+                            {
+                                "InputArtifacts": [],
+                                "Name": "Source",
+                                "ActionTypeId": {
+                                    "Category": "Source",
+                                    "Owner": "AWS",
+                                    "Version": "1",
+                                    "Provider": "CodeCommit"
+                                },
+                                "OutputArtifacts": [
+                                    {
+                                        "Name": "TemplateArtifact"
+                                    }
+                                ],
+                                "Configuration": {
+                                    "BranchName": {
+                                        "Ref": "SourceRepoBranch"
+                                    },
+                                    "RepositoryName": {
+                                        "Ref": "CodeCommitRepoName"
+                                    }
+                                },
+                                "RunOrder": 1
+                            }
+                        ]
+                    },
+                    {
+                        "Name": "PreCreateTests",
+                        "Actions": [
+                            {
+                                "InputArtifacts": [
+                                    {
+                                        "Name": "TemplateArtifact"
+                                    }
+                                ],
+                                "Name": "Validate_Template",
+                                "ActionTypeId": {
+                                    "Category": "Invoke",
+                                    "Owner": "AWS",
+                                    "Version": "1",
+                                    "Provider": "Lambda"
+                                },
+                                "OutputArtifacts": [],
+                                "Configuration": {
+                                    "FunctionName": "Validate_Template",
+                                    "UserParameters": {
+                                        "Fn::Sub": [
+                                            "{ \"StackId\": \"${AWS::StackId}\", \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                            {
+                                                "CITestPath": {
+                                                    "Fn::FindInMap": [
+                                                        "General",
+                                                        "CIConfig",
+                                                        "CITestPath"
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                "RunOrder": 1
+                            },
+                            {
+                                "Fn::If": [
+                                    "EnablePreCreateTest1",
+                                    {
+                                        "InputArtifacts": [
+                                            {
+                                                "Name": "TemplateArtifact"
+                                            }
+                                        ],
+                                        "Name": {
+                                            "Ref": "PreCreateTest1"
+                                        },
+                                        "ActionTypeId": {
+                                            "Category": "Invoke",
+                                            "Owner": "AWS",
+                                            "Version": "1",
+                                            "Provider": "Lambda"
+                                        },
+                                        "OutputArtifacts": [],
+                                        "Configuration": {
+                                            "FunctionName": {
+                                                "Ref": "PreCreateTest1"
+                                            },
+                                            "UserParameters": {
+                                                "Fn::Sub": [
+                                                    "{ \"StackId\": \"${AWS::StackId}\", \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                    {
+                                                        "CITestPath": {
+                                                            "Fn::FindInMap": [
+                                                                "General",
+                                                                "CIConfig",
+                                                                "CITestPath"
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        "RunOrder": 2
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            },
+                            {
+                                "Fn::If": [
+                                    "EnablePreCreateTest2",
+                                    {
+                                        "InputArtifacts": [
+                                            {
+                                                "Name": "TemplateArtifact"
+                                            }
+                                        ],
+                                        "Name": {
+                                            "Ref": "PreCreateTest2"
+                                        },
+                                        "ActionTypeId": {
+                                            "Category": "Invoke",
+                                            "Owner": "AWS",
+                                            "Version": "1",
+                                            "Provider": "Lambda"
+                                        },
+                                        "OutputArtifacts": [],
+                                        "Configuration": {
+                                            "FunctionName": {
+                                                "Ref": "PreCreateTest2"
+                                            },
+                                            "UserParameters": {
+                                                "Fn::Sub": [
+                                                    "{ \"StackId\": \"${AWS::StackId}\", \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                    {
+                                                        "CITestPath": {
+                                                            "Fn::FindInMap": [
+                                                                "General",
+                                                                "CIConfig",
+                                                                "CITestPath"
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        "RunOrder": 2
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            },
+                            {
+                                "Fn::If": [
+                                    "EnablePreCreateTest3",
+                                    {
+                                        "InputArtifacts": [
+                                            {
+                                                "Name": "TemplateArtifact"
+                                            }
+                                        ],
+                                        "Name": {
+                                            "Ref": "PreCreateTest3"
+                                        },
+                                        "ActionTypeId": {
+                                            "Category": "Invoke",
+                                            "Owner": "AWS",
+                                            "Version": "1",
+                                            "Provider": "Lambda"
+                                        },
+                                        "OutputArtifacts": [],
+                                        "Configuration": {
+                                            "FunctionName": {
+                                                "Ref": "PreCreateTest3"
+                                            },
+                                            "UserParameters": {
+                                                "Fn::Sub": [
+                                                    "{ \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                    {
+                                                        "CITestPath": {
+                                                            "Fn::FindInMap": [
+                                                                "General",
+                                                                "CIConfig",
+                                                                "CITestPath"
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        "RunOrder": 3
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            },
+                            {
+                                "Fn::If": [
+                                    "EnablePreCreateTest4",
+                                    {
+                                        "InputArtifacts": [
+                                            {
+                                                "Name": "TemplateArtifact"
+                                            }
+                                        ],
+                                        "Name": {
+                                            "Ref": "PreCreateTest4"
+                                        },
+                                        "ActionTypeId": {
+                                            "Category": "Invoke",
+                                            "Owner": "AWS",
+                                            "Version": "1",
+                                            "Provider": "Lambda"
+                                        },
+                                        "OutputArtifacts": [],
+                                        "Configuration": {
+                                            "FunctionName": {
+                                                "Ref": "PreCreateTest4"
+                                            },
+                                            "UserParameters": {
+                                                "Fn::Sub": [
+                                                    "{ \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                    {
+                                                        "CITestPath": {
+                                                            "Fn::FindInMap": [
+                                                                "General",
+                                                                "CIConfig",
+                                                                "CITestPath"
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        "RunOrder": 3
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "Name": "StackCreation",
+                        "Actions": [
+                            {
+                                "InputArtifacts": [
+                                    {
+                                        "Name": "TemplateArtifact"
+                                    }
+                                ],
+                                "Name": "Create_Stacks",
+                                "ActionTypeId": {
+                                    "Category": "Invoke",
+                                    "Owner": "AWS",
+                                    "Version": "1",
+                                    "Provider": "Lambda"
+                                },
+                                "OutputArtifacts": [
+                                    {
+                                        "Name": "StackArtifact"
+                                    }
+                                ],
+                                "Configuration": {
+                                    "FunctionName": {
+                                        "Fn::ImportValue": "CreateStacksLambdaName"
+                                    },
+                                    "UserParameters": {
+                                        "Fn::Sub": [
+                                            "{ \"CleanupPrevious\": \"${CleanupPrevious}\", \"CleanupNonFailed\": \"${CleanupNonFailed}\", \"CleanupFailed\": \"${CleanupFailed}\", \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\", \"StackCreationRoleArn\": \"${StackCreationRoleArn}\", \"KeyBucket\": \"${KeyBucket}\" }",
+                                            {
+                                                "CITestPath": {
+                                                    "Fn::FindInMap": [
+                                                        "General",
+                                                        "CIConfig",
+                                                        "CITestPath"
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                "RunOrder": 1
+                            }
+                        ]
+                    },
+                    {
+                        "Fn::If": [
+                            "EnablePostCreateTest1",
+                            {
+                                "Name": "PostCreateTests",
+                                "Actions": [
+                                    {
+                                        "InputArtifacts": [
+                                            {
+                                                "Name": "StackArtifact"
+                                            }
+                                        ],
+                                        "Name": {
+                                            "Ref": "PostCreateTest1"
+                                        },
+                                        "ActionTypeId": {
+                                            "Category": "Invoke",
+                                            "Owner": "AWS",
+                                            "Version": "1",
+                                            "Provider": "Lambda"
+                                        },
+                                        "OutputArtifacts": [],
+                                        "Configuration": {
+                                            "FunctionName": {
+                                                "Ref": "PostCreateTest1"
+                                            },
+                                            "UserParameters": {
+                                                "Fn::Sub": [
+                                                    "{ \"StackId\": \"${AWS::StackId}\", \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                    {
+                                                        "CITestPath": {
+                                                            "Fn::FindInMap": [
+                                                                "General",
+                                                                "CIConfig",
+                                                                "CITestPath"
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        "RunOrder": 1
+                                    },
+                                    {
+                                        "Fn::If": [
+                                            "EnablePostCreateTest2",
+                                            {
+                                                "InputArtifacts": [
+                                                    {
+                                                        "Name": "StackArtifact"
+                                                    }
+                                                ],
+                                                "Name": {
+                                                    "Ref": "PostCreateTest2"
+                                                },
+                                                "ActionTypeId": {
+                                                    "Category": "Invoke",
+                                                    "Owner": "AWS",
+                                                    "Version": "1",
+                                                    "Provider": "Lambda"
+                                                },
+                                                "OutputArtifacts": [],
+                                                "Configuration": {
+                                                    "FunctionName": {
+                                                        "Ref": "PostCreateTest2"
+                                                    },
+                                                    "UserParameters": {
+                                                        "Fn::Sub": [
+                                                            "{ \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                            {
+                                                                "CITestPath": {
+                                                                    "Fn::FindInMap": [
+                                                                        "General",
+                                                                        "CIConfig",
+                                                                        "CITestPath"
+                                                                    ]
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                                "RunOrder": 1
+                                            },
+                                            {
+                                                "Ref": "AWS::NoValue"
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "Fn::If": [
+                                            "EnablePostCreateTest3",
+                                            {
+                                                "InputArtifacts": [
+                                                    {
+                                                        "Name": "StackArtifact"
+                                                    }
+                                                ],
+                                                "Name": {
+                                                    "Ref": "PostCreateTest3"
+                                                },
+                                                "ActionTypeId": {
+                                                    "Category": "Invoke",
+                                                    "Owner": "AWS",
+                                                    "Version": "1",
+                                                    "Provider": "Lambda"
+                                                },
+                                                "OutputArtifacts": [],
+                                                "Configuration": {
+                                                    "FunctionName": {
+                                                        "Ref": "PostCreateTest3"
+                                                    },
+                                                    "UserParameters": {
+                                                        "Fn::Sub": [
+                                                            "{ \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                            {
+                                                                "CITestPath": {
+                                                                    "Fn::FindInMap": [
+                                                                        "General",
+                                                                        "CIConfig",
+                                                                        "CITestPath"
+                                                                    ]
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                                "RunOrder": 2
+                                            },
+                                            {
+                                                "Ref": "AWS::NoValue"
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "Fn::If": [
+                                            "EnablePostCreateTest4",
+                                            {
+                                                "InputArtifacts": [
+                                                    {
+                                                        "Name": "StackArtifact"
+                                                    }
+                                                ],
+                                                "Name": {
+                                                    "Ref": "PostCreateTest4"
+                                                },
+                                                "ActionTypeId": {
+                                                    "Category": "Invoke",
+                                                    "Owner": "AWS",
+                                                    "Version": "1",
+                                                    "Provider": "Lambda"
+                                                },
+                                                "OutputArtifacts": [],
+                                                "Configuration": {
+                                                    "FunctionName": {
+                                                        "Ref": "PostCreateTest4"
+                                                    },
+                                                    "UserParameters": {
+                                                        "Fn::Sub": [
+                                                            "{ \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\" }",
+                                                            {
+                                                                "CITestPath": {
+                                                                    "Fn::FindInMap": [
+                                                                        "General",
+                                                                        "CIConfig",
+                                                                        "CITestPath"
+                                                                    ]
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                                "RunOrder": 2
+                                            },
+                                            {
+                                                "Ref": "AWS::NoValue"
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "Ref": "AWS::NoValue"
+                            }
+                        ]
+                    },
+                    {
+                        "Name": "ApprovalAndReporting",
+                        "Actions": [
+                            {
+                                "InputArtifacts": [
+                                    {
+                                        "Name": "StackArtifact"
+                                    }
+                                ],
+                                "Name": "Generate_Report",
+                                "ActionTypeId": {
+                                    "Category": "Invoke",
+                                    "Owner": "AWS",
+                                    "Version": "1",
+                                    "Provider": "Lambda"
+                                },
+                                "OutputArtifacts": [],
+                                "Configuration": {
+                                    "FunctionName": {
+                                        "Fn::ImportValue": "GenerateReportLambdaName"
+                                    },
+                                    "UserParameters": {
+                                        "Fn::Sub": [
+                                            "{ \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\", \"ReportBucket\": \"${ReportBucketName}\", \"ReportKey\": \"${ReportKey}\", \"SNSTopic\": \"${SNSTopic}\"}",
+                                            {
+                                                "ReportBucketName": {
+                                                    "Ref": "DeployBucket"
+                                                },
+                                                "CITestPath": {
+                                                    "Fn::FindInMap": [
+                                                        "General",
+                                                        "CIConfig",
+                                                        "CITestPath"
+                                                    ]
+                                                },
+                                                "ReportKey": {
+                                                    "Fn::FindInMap": [
+                                                        "General",
+                                                        "Prefix",
+                                                        "ReportKey"
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                "RunOrder": 1
+                            },
+                            {
+                                "Fn::If": [
+                                    "ManualApproval",
+                                    {
+                                        "InputArtifacts": [],
+                                        "Name": "Manual_Approval",
+                                        "ActionTypeId": {
+                                            "Category": "Approval",
+                                            "Owner": "AWS",
+                                            "Version": "1",
+                                            "Provider": "Manual"
+                                        },
+                                        "Configuration": {
+                                            "NotificationArn": {
+                                                "Ref": "SNSTopic"
+                                            },
+                                            "ExternalEntityLink": {
+                                                "Fn::Join": [
+                                                    "",
+                                                    [
+                                                        "https://",
+                                                        {
+                                                            "Ref": "AWS::Region"
+                                                        },
+                                                        ".console.aws.amazon.com/codepipeline/home?region=",
+                                                        {
+                                                            "Ref": "AWS::Region"
+                                                        },
+                                                        "#/dashboard"
+                                                    ]
+                                                ]
+                                            },
+                                            "CustomData": "Please thouroughly review pipeline test results, template and stacks before approving."
+                                        },
+                                        "RunOrder": 2
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "Name": "Deployment",
+                        "Actions": [
+                            {
+                                "InputArtifacts": [
+                                    {
+                                        "Name": "TemplateArtifact"
+                                    }
+                                ],
+                                "Name": "Deploy_To_S3",
+                                "ActionTypeId": {
+                                    "Category": "Invoke",
+                                    "Owner": "AWS",
+                                    "Version": "1",
+                                    "Provider": "Lambda"
+                                },
+                                "Configuration": {
+                                    "FunctionName": {
+                                        "Fn::ImportValue": "DeployToS3LambdaName"
+                                    },
+                                    "UserParameters": {
+                                        "Fn::Sub": [
+                                            "{ \"DeployKey\": \"${DeployKey}\", \"DeployBucket\": \"${DeployBucket}\", \"CleanupPrevious\": \"${CleanupPrevious}\", \"CleanupNonFailed\": \"${CleanupNonFailed}\", \"CleanupFailed\": \"${CleanupFailed}\", \"CITestPath\": \"${CITestPath}\", \"ScratchBucket\": \"${ScratchBucket}\", \"StackCreationRoleArn\": \"${StackCreationRoleArn}\", \"KeyBucket\": \"${KeyBucket}\" }",
+                                            {
+                                                "CITestPath": {
+                                                    "Fn::FindInMap": [
+                                                        "General",
+                                                        "CIConfig",
+                                                        "CITestPath"
+                                                    ]
+                                                },
+                                                "DeployKey": {
+                                                    "Fn::FindInMap": [
+                                                        "General",
+                                                        "Prefix",
+                                                        "DeployKey"
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                "RunOrder": 1
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        "SNSTopic": {
+            "Condition": "ManualApproval",
+            "Type": "AWS::SNS::Topic",
+            "Properties": {
+                "Subscription": [
+                    {
+                        "Fn::If": [
+                            "EmailPrimary",
+                            {
+                                "Endpoint": {
+                                    "Ref": "EmailPrimary"
+                                },
+                                "Protocol": "email"
+                            },
+                            {
+                                "Ref": "AWS::NoValue"
+                            }
+                        ]
+                    },
+                    {
+                        "Fn::If": [
+                            "EmailSecondary",
+                            {
+                                "Endpoint": {
+                                    "Ref": "EmailSecondary"
+                                },
+                                "Protocol": "email"
+                            },
+                            {
+                                "Ref": "AWS::NoValue"
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        "NotificationSchedule": {
+            "Type": "AWS::Events::Rule",
+            "Condition": "EmailPrimary",
+            "Properties": {
+                "Description": {
+                    "Fn::Join": [
+                        "-",
+                        [
+                            "NotificationSchedule",
+                            {
+                                "Ref": "AWS::Region"
+                            },
+                            {
+                                "Ref": "AWS::StackName"
+                            }
+                        ]
+                    ]
+                },
+                "ScheduleExpression": "rate(5 minutes)",
+                "State": "ENABLED",
+                "Targets": [
+                    {
+                        "Arn": {
+                            "Fn::GetAtt": [
+                                "NotificationLambda",
+                                "Arn"
+                            ]
+                        },
+                        "Id": "NotificationTarget",
+                        "Input": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "{\"pipeline\": \"",
+                                    {
+                                        "Ref": "CodePipeline"
+                                    },
+                                    "\", \"region\": \"",
+                                    {
+                                        "Ref": "AWS::Region"
+                                    },
+                                    "\", \"topic\": \"",
+                                    {
+                                        "Ref": "SNSTopic"
+                                    },
+                                    "\"}"
+                                ]
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "NotificationPermissions": {
+            "Condition": "EmailPrimary",
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Ref": "NotificationLambda"
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "events.amazonaws.com",
+                "SourceArn": {
+                    "Fn::GetAtt": [
+                        "NotificationSchedule",
+                        "Arn"
+                    ]
+                }
+            }
+        },
+        "NotificationRole": {
+            "Condition": "EmailPrimary",
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "schedulednotification",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "codepipeline:GetPipeline",
+                                        "codepipeline:GetPipelineState"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:*"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "codepipeline:ListPipelines"
+                                    ],
+                                    "Resource": [
+                                        "*"
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents",
+                                        "logs:FilterLogEvents"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Action": [
+                                        "sns:Publish"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Ref": "SNSTopic"
+                                        }
+                                    ],
+                                    "Effect": "Allow"
+                                },
+                                {
+                                    "Action": [
+                                        "dynamodb:PutItem",
+                                        "dynamodb:GetItem",
+                                        "dynamodb:Query",
+                                        "dynamodb:UpdateItem"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Join": [
+                                                "",
+                                                [
+                                                    "arn:aws:dynamodb:",
+                                                    {
+                                                        "Ref": "AWS::Region"
+                                                    },
+                                                    ":",
+                                                    {
+                                                        "Ref": "AWS::AccountId"
+                                                    },
+                                                    ":table/",
+                                                    {
+                                                        "Ref": "NotificationDynamoTable"
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ],
+                                    "Effect": "Allow"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "NotificationDynamoTable": {
+            "Condition": "EmailPrimary",
+            "Type": "AWS::DynamoDB::Table",
+            "Properties": {
+                "AttributeDefinitions": [
+                    {
+                        "AttributeName": "FailureId",
+                        "AttributeType": "S"
+                    }
+                ],
+                "KeySchema": [
+                    {
+                        "AttributeName": "FailureId",
+                        "KeyType": "HASH"
+                    }
+                ],
+                "ProvisionedThroughput": {
+                    "ReadCapacityUnits": 1,
+                    "WriteCapacityUnits": 1
+                }
+            }
+        },
+        "NotificationLambda": {
+            "Condition": "EmailPrimary",
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Handler": {
+                    "Fn::Join": [
+                        ".",
+                        [
+                            {
+                                "Fn::FindInMap": [
+                                    "Functions",
+                                    "Notification",
+                                    "Handler"
+                                ]
+                            },
+                            "lambda_handler"
+                        ]
+                    ]
+                },
+                "MemorySize": "512",
+                "Role": {
+                    "Fn::GetAtt": [
+                        "NotificationRole",
+                        "Arn"
+                    ]
+                },
+                "Runtime": "python2.7",
+                "Timeout": "300",
+                "Code": {
+                    "S3Bucket": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3BucketPrefix"
+                                    ]
+                                },
+                                {
+                                "Fn::If": [
+                                    "UseRelativeBucket",
+                                    {
+                                        "Ref": "AWS::Region"
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            }
+                            ]
+                        ]
+                    },
+                    "S3Key": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3KeyPrefix"
+                                    ]
+                                },
+                                {
+                                    "Fn::FindInMap": [
+                                        "Functions",
+                                        "Notification",
+                                        "S3Key"
+                                    ]
+                                }
+                            ]
+                        ]
+                    }
+                },
+                "Environment": {
+                    "Variables": {
+                        "table_name": {
+                            "Ref": "NotificationDynamoTable"
+                        }
+                    }
+                }
+            }
+        },
+        "CodeBuildServiceRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "codebuild.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "codebuildrole",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CFN-Lint-${CodePipeline}"
+                                        },
+                                        {
+                                            "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CFN-Lint-${CodePipeline}:*"
+                                        }
+                                    ],
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ]
+                                },
+                                {
+                                    "Action": [
+                                        "codeCommit:GetUploadArchiveStatus",
+                                        "codecommit:CancelUploadArchive",
+                                        "codecommit:GetBranch",
+                                        "codecommit:GetCommit",
+                                        "codecommit:GitPull",
+                                        "codecommit:GetUploadStatus",
+                                        "codecommit:UploadArchive"
+                                    ],
+                                    "Resource": {
+                                        "Fn::Join": [
+                                            ":",
+                                            [
+                                                "arn:aws:codecommit",
+                                                {
+                                                    "Ref": "AWS::Region"
+                                                },
+                                                {
+                                                    "Ref": "AWS::AccountId"
+                                                },
+                                                {
+                                                    "Ref": "CodeCommitRepoName"
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "Effect": "Allow"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:s3:::codepipeline-${AWS::Region}-*"
+                                        }
+                                    ],
+                                    "Action": [
+                                        "s3:PutObject",
+                                        "s3:GetObject",
+                                        "s3:GetObjectVersion"
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "CodeBuildProject": {
+            "Type": "AWS::CodeBuild::Project",
+            "Properties": {
+                "Name": {
+                    "Fn::Sub": "CFN-Lint-${CodePipeline}"
+                },
+                "Description": "Submit build jobs as part of CFN Template CI/CD pipeline",
+                "ServiceRole": {
+                    "Fn::GetAtt": [
+                        "CodeBuildServiceRole",
+                        "Arn"
+                    ]
+                },
+                "Artifacts": {
+                    "Type": "no_artifacts"
+                },
+                "Environment": {
+                    "Type": "LINUX_CONTAINER",
+                    "ComputeType": "BUILD_GENERAL1_SMALL",
+                    "Image": "ubuntu:16.04"
+                },
+                "Source": {
+                    "Location": {
+                        "Fn::Sub": "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${CodeCommitRepoName}"
+                    },
+                    "Type": "CODECOMMIT"
+                },
+                "TimeoutInMinutes": 10
+            }
+        },
+        "AnonReporting": {
+            "Condition": "EnableAnonReporting",
+            "Type": "Custom::LoadLambda",
+            "Properties": {
+                "ServiceToken": {
+                    "Fn::GetAtt": [
+                        "AnonReportingLambda",
+                        "Arn"
+                    ]
+                },
+                "SolutionID": "SO0025"
+            }
+        },
+        "AnonReportingRole": {
+            "Condition": "EnableAnonReporting",
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "Anon_Reporting_Permissions",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "AnonReportingLambda": {
+            "Condition": "EnableAnonReporting",
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Handler": {
+                    "Fn::Join": [
+                        ".",
+                        [
+                            {
+                                "Fn::FindInMap": [
+                                    "Functions",
+                                    "AnonymousReporting",
+                                    "Handler"
+                                ]
+                            },
+                            "lambda_handler"
+                        ]
+                    ]
+                },
+                "Role": {
+                    "Fn::GetAtt": [
+                        "AnonReportingRole",
+                        "Arn"
+                    ]
+                },
+                "Description": "CloudFormation Validation Pipeline: CloudFormation custom resource function invoked during CloudFormation create, update, and delete stack operations.",
+                "Code": {
+                    "S3Bucket": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3BucketPrefix"
+                                    ]
+                                },
+                                {
+                                "Fn::If": [
+                                    "UseRelativeBucket",
+                                    {
+                                        "Ref": "AWS::Region"
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            }
+                            ]
+                        ]
+                    },
+                    "S3Key": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3KeyPrefix"
+                                    ]
+                                },
+                                {
+                                    "Fn::FindInMap": [
+                                        "Functions",
+                                        "AnonymousReporting",
+                                        "S3Key"
+                                    ]
+                                }
+                            ]
+                        ]
+                    }
+                },
+                "Runtime": "python2.7",
+                "Timeout": "60"
+            }
+        },
+        "CleanupStacks": {
+            "Type": "Custom::StackCleanup",
+            "Properties": {
+                "ServiceToken": {
+                    "Fn::GetAtt": [
+                        "CleanupStacksLambda",
+                        "Arn"
+                    ]
+                },
+                "Pipeline": {
+                    "Ref": "CodePipeline"
+                }
+            }
+        },
+        "CleanupStacksRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "Cleanup_Stacks_Permissions",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "cloudformation:ListStacks",
+                                        "cloudformation:DescribeStacks"
+                                    ],
+                                    "Resource": "*"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "cloudformation:DeleteStack"
+                                    ],
+                                    "Resource": [
+                                        {
+                                            "Fn::Sub": "arn:aws:cloudformation:*:${AWS::AccountId}:stack/ci-*"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "cloudformation:DescribeStacks",
+                                        "cloudformation:ListStacks"
+                                    ],
+                                    "Resource": [
+                                        "*"
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "CleanupStacksLambda": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Handler": {
+                    "Fn::Join": [
+                        ".",
+                        [
+                            {
+                                "Fn::FindInMap": [
+                                    "Functions",
+                                    "CleanupStacks",
+                                    "Handler"
+                                ]
+                            },
+                            "lambda_handler"
+                        ]
+                    ]
+                },
+                "Role": {
+                    "Fn::GetAtt": [
+                        "CleanupStacksRole",
+                        "Arn"
+                    ]
+                },
+                "Description": "CloudFormation Validation Pipeline: CloudFormation custom resource to cleanup remaining testing stacks when the pipeline stack is deleted.",
+                "Code": {
+                    "S3Bucket": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3BucketPrefix"
+                                    ]
+                                },
+                                {
+                                "Fn::If": [
+                                    "UseRelativeBucket",
+                                    {
+                                        "Ref": "AWS::Region"
+                                    },
+                                    {
+                                        "Ref": "AWS::NoValue"
+                                    }
+                                ]
+                            }
+                            ]
+                        ]
+                    },
+                    "S3Key": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                {
+                                    "Fn::FindInMap": [
+                                        "General",
+                                        "CodeRepo",
+                                        "S3KeyPrefix"
+                                    ]
+                                },
+                                {
+                                    "Fn::FindInMap": [
+                                        "Functions",
+                                        "CleanupStacks",
+                                        "S3Key"
+                                    ]
+                                }
+                            ]
+                        ]
+                    }
+                },
+                "Runtime": "python2.7",
+                "Timeout": "300"
+            }
+        }
+    },
+    "Outputs": {
+        "DeploymentBucket": {
+            "Value": {
+                "Ref": "DeployBucket"
+            }
+        }
+    }
+}
