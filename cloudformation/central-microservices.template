@@ -1,6 +1,6 @@
 {
     "AWSTemplateFormatVersion": "2010-09-09",
-    "Description": "CFN CI/CD pipeline central services",
+    "Description": "(SO0025): CFN CI/CD pipeline central services",
     "Metadata": {
         "AWS::CloudFormation::Interface": {
             "ParameterGroups": [

@@ -3,7 +3,7 @@ Usage
 
 A demo and deployment guide describing this solution are available on the AWS Answers website.
 
-To start writing your own tests and pipelines to test your templates it's likely your going to want to customise which tests are run and even write your own tests.
+To start writing your own tests and pipelines to test your templates it's likely your going to want to customize which tests are run and even write your own tests.
 
 To ensure that any binary dependencies you may have are built for the correct platform it is recommended to create a new ec2 instance using the amzn-ami-hvm-2016.03.3.x86_64-gp2 AMI and run the build process from there.
 
@@ -46,7 +46,7 @@ cd aws-cloudformation-validation-pipeline
 sudo -H python setup.py install
 ```
 
-Now you're ready to start building tests and pipleines, to get going create a project skeleton:
+Now you're ready to start building tests and pipelines, to get going create a project skeleton:
 ```bash
 cd ~/
 cfn-validation-pipeline-skeleton
@@ -60,7 +60,7 @@ Building/deploying dependencies, Lambda function zips and CloudFormation templat
 cfn-validation-pipeline-deploy my-cfn-pipeline-bucket
 ```
 
-***Note:*** this commmand has several configurable options, to view help for the deployment tools run the command with the --help argument
+***Note:*** this command has several configurable options, to view help for the deployment tools run the command with the --help argument
 
 Now you can launch stacks from the cloudformation console using the s3 location for the desired cloudformation template in the output of the previous command.
 
